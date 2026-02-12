@@ -2,58 +2,42 @@
 
 A quick way to compare clocks between your servers.
 
+## How It Works
+
+The service uses a time synchronization algorithm similar to NTP to measure clock differences between hosts. Each measurement consists of four timestamps to calculate:
+- **Clock Delta (Δ)**: The offset between the remote and local clock
+- **RTT (Round-Trip Time)**: The network delay for the measurement
+
 ## Exporter
 
-```
-=== TimeDelta Exporter  |  2026-02-12 03:21:17 CET ===
+Dev: http://127.0.0.1:18220/tdsvc_exporter
 
-  Host: 2d1577a13ac4
-    Neighbour             Dead  Syncs    Clock Δ (last)    Clock Δ (mean)    RTT (last)    RTT (mean)
-    ─────────────────────────────────────────────────────────────────────────────────────────────────
-    084cb9884c56          DEAD      –                 –                 –             –             –
-    0cd30a620414          DEAD      –                 –                 –             –             –
-    6276f7f74275          DEAD      –                 –                 –             –             –
-    af085a932247          DEAD      –                 –                 –             –             –
-    ginger                  ok     17         -1.469925         -1.427447      0.776184      0.737536
-    laptop-local            ok     17         -0.011882         -0.031112      1.307451      1.180117
-    trixie                  ok     18         -0.261688         -0.260921      0.958644      0.868325
-
-  Host: ginger
-    Neighbour             Dead  Syncs    Clock Δ (last)    Clock Δ (mean)    RTT (last)    RTT (mean)
-    ─────────────────────────────────────────────────────────────────────────────────────────────────
-    084cb9884c56          DEAD      –                 –                 –             –             –
-    0cd30a620414          DEAD      –                 –                 –             –             –
-    2d1577a13ac4            ok     16         +1.253867         +1.256548      0.406100      0.424577
-    6276f7f74275          DEAD      –                 –                 –             –             –
-    af085a932247          DEAD      –                 –                 –             –             –
-    laptop-local            ok     16         +1.268306         +1.243314      0.375958      0.374465
-    trixie                  ok     16         +1.193156         +1.185808      0.133299      0.126673
-
-  Host: laptop-local
-    Neighbour             Dead  Syncs    Clock Δ (last)    Clock Δ (mean)    RTT (last)    RTT (mean)
-    ─────────────────────────────────────────────────────────────────────────────────────────────────
-    084cb9884c56          DEAD      –                 –                 –             –             –
-    0cd30a620414          DEAD      –                 –                 –             –             –
-    2d1577a13ac4            ok     16         -0.268757         -0.206228      1.238955      0.970567
-    6276f7f74275          DEAD      –                 –                 –             –             –
-    af085a932247          DEAD     85         -0.136749         -0.135326      0.805551      0.708027
-    ginger                  ok    205         -1.224842         -1.232949      0.415384      0.369481
-    trixie                  ok    193         -0.091415         -0.120468      0.526906      0.506582
-
-  Host: trixie
-    Neighbour             Dead  Syncs    Clock Δ (last)    Clock Δ (mean)    RTT (last)    RTT (mean)
-    ─────────────────────────────────────────────────────────────────────────────────────────────────
-    084cb9884c56          DEAD      –                 –                 –             –             –
-    0cd30a620414          DEAD      –                 –                 –             –             –
-    2d1577a13ac4            ok     18         -0.067223         -0.038465      0.181893      0.223458
-    6276f7f74275          DEAD      –                 –                 –             –             –
-    af085a932247          DEAD      –                 –                 –             –             –
-    ginger                  ok     25         -1.171784         -1.173408      0.089296      0.101610
-    laptop-local            ok     33         -0.066224         -0.039094      0.136033      0.193806
-
-  (4 host(s) reporting)
+The exporter displays clock delta statistics with RTT-based filtering:
 
 ```
+=== TimeDelta Exporter  |  2026-02-12 14:52:03 UTC ===
+
+  Host: dev-docker-1
+    Neighbour             Dead  Syncs        Δ (best)        Δ (filt)         Δ (raw)    RTT (last)    RTT (best)
+    ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    dev-docker-2            ok     20       +0.999364       +0.998270       +0.998241      7.005943      7.003631
+    dev-docker-3            ok     20       +0.999414       +0.999482       +0.999414      8.005248      8.005248
+
+  Host: dev-docker-2
+    Neighbour             Dead  Syncs        Δ (best)        Δ (filt)         Δ (raw)    RTT (last)    RTT (best)
+    ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    dev-docker-1            ok     20       +0.999152       +0.998768       +0.999194      7.004374      7.004147
+    dev-docker-3            ok     20       +0.998462       +0.999001       +0.997917      8.006615      8.004828
+
+  Host: dev-docker-3
+    Neighbour             Dead  Syncs        Δ (best)        Δ (filt)         Δ (raw)    RTT (last)    RTT (best)
+    ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    dev-docker-1            ok     20       +0.999025       +0.999102       +0.997467      7.009017      7.002918
+    dev-docker-2            ok     20       +0.999343       +0.999086       +0.998220      7.006397      7.002425
+
+  (3 host(s) reporting)
+```
+
 
 ## Support
 

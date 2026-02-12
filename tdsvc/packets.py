@@ -31,6 +31,12 @@ class SyncStats:
     min_rtt: float = 0.0
     max_rtt: float = 0.0
     mean_rtt: float = 0.0
+    # RTT-filtered statistics (more accurate)
+    best_clock_delta: float = 0.0  # Clock delta from measurement with minimum RTT
+    best_rtt: float = 0.0  # The minimum RTT value
+    filtered_mean_clock_delta: float = 0.0  # Mean of lowest-RTT measurements
+    # Sliding window of recent measurements: [(clock_delta, rtt), ...]
+    recent_measurements: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -48,6 +54,10 @@ class SyncStats:
             min_rtt=data.get("min_rtt", 0.0),
             max_rtt=data.get("max_rtt", 0.0),
             mean_rtt=data.get("mean_rtt", 0.0),
+            best_clock_delta=data.get("best_clock_delta", 0.0),
+            best_rtt=data.get("best_rtt", 0.0),
+            filtered_mean_clock_delta=data.get("filtered_mean_clock_delta", 0.0),
+            recent_measurements=data.get("recent_measurements", []),
         )
 
 
@@ -230,6 +240,7 @@ class MyTimePacket(BasePacket):
     :param request_id: str: The ID of the original WhatTimeIsItPacket being responded to.
     :param request_timestamp: float: The timestamp from the original WhatTimeIsItPacket.
     :param received_at: float: The responder's local timestamp when it received the request.
+    :param response_delay: float: Intentional delay (in seconds) added before responding (default: 0.0).
     :param timestamp: float: The responder's local timestamp when it created this response.
     :param time: str: Human-readable local time string.
     """
@@ -237,6 +248,7 @@ class MyTimePacket(BasePacket):
     request_id: str = ""
     request_timestamp: float = 0.0
     received_at: float = 0.0
+    response_delay: float = 0.0
     timestamp: float = field(default_factory=time.time)
     time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()))
 
@@ -250,6 +262,7 @@ class MyTimePacket(BasePacket):
             request_id=data.get("request_id", ""),
             request_timestamp=data.get("request_timestamp", 0.0),
             received_at=data.get("received_at", 0.0),
+            response_delay=data.get("response_delay", 0.0),
             timestamp=data.get("timestamp", time.time()),
             time=data.get("time", time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())),
         )

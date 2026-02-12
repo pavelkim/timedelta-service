@@ -30,6 +30,47 @@ from tdsvc.packets import (
     TimeDeltaResult,
 )
 
+def calculate_time_delta(
+    local_send_ts: float,
+    remote_receive_ts: float,
+    remote_send_ts: float,
+    local_receive_ts: float,
+    response_delay: float = 0.0,
+    request_id: str = "",
+    remote_source: str = "",
+) -> TimeDeltaResult:
+    """
+    Calculate clock offset and round-trip time using the four timestamps
+    (similar to NTP symmetric algorithm).
+
+    Clock delta (θ) ≈ ((T2 - T1) + (T3 - T4)) / 2
+    RTT (δ)          = (T4 - T1) - (T3 - T2) + response_delay
+
+    Where:
+        T1 = local_send_ts      (local time when request was sent)
+        T2 = remote_receive_ts  (remote time when request was received)
+        T3 = remote_send_ts     (remote time when response was sent)
+        T4 = local_receive_ts   (local time when response was received)
+        response_delay          (intentional delay added by remote before responding)
+    
+    The response_delay is added back to get the actual network RTT,
+    excluding the intentional processing delay.
+    """
+    # Calculate RTT excluding intentional delay
+    rtt = (local_receive_ts - local_send_ts) - (remote_send_ts - remote_receive_ts) + response_delay
+    clock_delta = ((remote_receive_ts - local_send_ts) + (remote_send_ts - local_receive_ts)) / 2.0
+
+    return TimeDeltaResult(
+        request_id=request_id,
+        remote_source=remote_source,
+        clock_delta=clock_delta,
+        rtt=rtt,
+        local_send_ts=local_send_ts,
+        remote_receive_ts=remote_receive_ts,
+        remote_send_ts=remote_send_ts,
+        local_receive_ts=local_receive_ts,
+    )
+
 
 class TimeDeltaService:
     """TimeDelta Service (tdsvc) - Clock comparison"""
@@ -48,15 +89,29 @@ class TimeDeltaService:
         self.neighbor_discovery_thread = None
         self.neighbor_discovery_interval = config("NEIGHBOR_DISCOVERY_INTERVAL", default=5, cast=int)
         self.neighbor_age_timeout = config("NEIGHBOR_AGE_TIMEOUT", default=10, cast=int)
+        self.exclude_dead_neighbours = config("EXCLUDE_DEAD_NEIGHBOURS", default=True, cast=bool)
         self.neighbours: dict[str, Neighbour] = {}
         self.neighbours_lock = threading.Lock()
 
         self.pending_requests: dict[str, float] = {}
         self.pending_requests_lock = threading.Lock()
-        self.pending_requests_max_age = config("PENDING_REQUESTS_MAX_AGE", default=10, cast=int)
-
+        # Base max age for pending requests configuration
+        base_max_age = config("PENDING_REQUESTS_MAX_AGE", default=10, cast=int)
+        
         self.time_deltas: list[TimeDeltaResult] = []
         self.time_deltas_lock = threading.Lock()
+
+        # RTT-based filtering configuration
+        self.measurements_window_size = config("MEASUREMENTS_WINDOW_SIZE", default=20, cast=int)
+        self.filtered_measurements_count = config("FILTERED_MEASUREMENTS_COUNT", default=5, cast=int)
+        
+        # Optional static response delay (in seconds) - makes RTT variations proportionally smaller
+        # Default 0 (disabled). Set to e.g. 5.0 to add 5-second delay before responding
+        self.response_delay = config("RESPONSE_DELAY", default=0.0, cast=float)
+        
+        # Actual max age accounting for response delay to prevent premature cleanup
+        # If peers use response_delay, we need to wait longer for responses
+        self.pending_requests_max_age = base_max_age + (self.response_delay * 2)
 
         self.rmq_server_uri = config("RMQ_SERVER_URI", default="amqp://guest:guest@localhost:5672/")
         self.rmq_exchange = config("RMQ_EXCHANGE", default="tdsvc_exchange")
@@ -104,7 +159,10 @@ class TimeDeltaService:
 
     def setup_time_query_thread(self):
         """Set up a background thread that periodically broadcasts 'what_time_is_it' packets."""
-        self.logger.info(f"Setting up the time query thread (interval={self.time_query_interval}s)")
+        self.logger.info(
+            f"Setting up the time query thread (interval={self.time_query_interval}s, "
+            f"pending_requests_ttl={self.pending_requests_max_age}s)"
+        )
         self.time_query_thread = threading.Thread(target=self.time_query_loop, daemon=True)
         self.time_query_thread.start()
 
@@ -208,10 +266,19 @@ class TimeDeltaService:
     def publish_neighbor_discovery(self):
         """Broadcast a 'neighbor_discovery' packet including known neighbours."""
         with self.neighbours_lock:
-            neighbours_data = [
-                neighbour.to_dict()
-                for neighbour in self.neighbours.values()
-            ]
+            if self.exclude_dead_neighbours:
+                # Only broadcast alive neighbours
+                neighbours_data = [
+                    neighbour.to_dict()
+                    for neighbour in self.neighbours.values()
+                    if not neighbour.dead
+                ]
+            else:
+                # Broadcast all neighbours including dead ones
+                neighbours_data = [
+                    neighbour.to_dict()
+                    for neighbour in self.neighbours.values()
+                ]
         packet = NeighborDiscoveryPacket(neighbours=neighbours_data)
         self.logger.debug(f"Broadcasting neighbor_discovery id={packet.id} with {len(neighbours_data)} known neighbours")
         self.publish_packet(packet)
@@ -278,6 +345,7 @@ class TimeDeltaService:
         with self.pending_requests_lock:
             stale = [rid for rid, ts in self.pending_requests.items() if (now - ts) > max_age]
             for rid in stale:
+                self.logger.debug(f"Cleaning up stale pending request id={rid} age={(now - self.pending_requests[rid]):.1f}s max_age={max_age}s")
                 del self.pending_requests[rid]
             if stale:
                 self.logger.debug(f"Cleaned up {len(stale)} stale pending requests")
@@ -297,6 +365,10 @@ class TimeDeltaService:
         """
         Handle an incoming 'what_time_is_it' packet by responding with 'my_time'.
         Records the local receive time and includes it in the response.
+        Optional: adds configured delay before responding to reduce proportional RTT variance.
+        
+        CRITICAL: If response_delay > 0, spawns a background thread to avoid blocking
+        the consumer thread and causing message queue buildup.
         """
         received_at = time.time()
         self.logger.debug(
@@ -304,12 +376,40 @@ class TimeDeltaService:
             f"(their time={packet.time})"
         )
 
+        # Optional static delay to reduce proportional impact of RTT variations
+        # IMPORTANT: Use background thread to avoid blocking the consumer
+        if self.response_delay > 0:
+            thread = threading.Thread(
+                target=self._send_delayed_response,
+                args=(packet.id, packet.timestamp, packet.source, received_at, self.response_delay),
+                daemon=True
+            )
+            thread.start()
+        else:
+            # No delay - respond immediately
+            response = MyTimePacket(
+                request_id=packet.id,
+                request_timestamp=packet.timestamp,
+                received_at=received_at,
+                response_delay=0.0,
+            )
+            self.logger.debug(f"my_time RESPONSE to {packet.source} id={packet.id} resp={response.id}")
+            self.publish_packet(response)
+
+    def _send_delayed_response(self, request_id: str, request_timestamp: float, 
+                               source: str, received_at: float, delay: float):
+        """
+        Send a delayed response in a background thread to avoid blocking the consumer.
+        """
+        time.sleep(delay)
+        
         response = MyTimePacket(
-            request_id=packet.id,
-            request_timestamp=packet.timestamp,
+            request_id=request_id,
+            request_timestamp=request_timestamp,
             received_at=received_at,
+            response_delay=delay,
         )
-        self.logger.debug(f"my_time RESPONSE to {packet.source} id={packet.id} resp={response.id}")
+        self.logger.debug(f"my_time RESPONSE to {source} id={request_id} resp={response.id} (delayed {delay}s)")
         self.publish_packet(response)
 
     def handle_my_time(self, packet: MyTimePacket):
@@ -338,11 +438,12 @@ class TimeDeltaService:
             self.logger.debug(f"my_time UNKNOWN for unknown/expired request_id={packet.request_id} from {packet.source}")
             return None
 
-        result = self.calculate_time_delta(
+        result = calculate_time_delta(
             local_send_ts=local_send_ts,
             remote_receive_ts=packet.received_at,
             remote_send_ts=packet.timestamp,
             local_receive_ts=local_receive_ts,
+            response_delay=packet.response_delay,
             request_id=packet.request_id,
             remote_source=packet.source,
         )
@@ -370,6 +471,14 @@ class TimeDeltaService:
             stats = neighbour.sync_stats
             sync_count = stats.sync_count + 1
 
+            # Add new measurement to sliding window
+            recent = list(stats.recent_measurements)  # Copy the list
+            recent.append((result.clock_delta, result.rtt))
+            
+            # Keep only the most recent N measurements
+            if len(recent) > self.measurements_window_size:
+                recent = recent[-self.measurements_window_size:]
+
             # Running min / max (first sample initialises both)
             if stats.sync_count == 0:
                 min_clock_delta = result.clock_delta
@@ -382,9 +491,20 @@ class TimeDeltaService:
                 min_rtt = min(stats.min_rtt, result.rtt)
                 max_rtt = max(stats.max_rtt, result.rtt)
 
-            # Cumulative moving average
+            # Cumulative moving average (unfiltered)
             mean_clock_delta = stats.mean_clock_delta + (result.clock_delta - stats.mean_clock_delta) / sync_count
             mean_rtt = stats.mean_rtt + (result.rtt - stats.mean_rtt) / sync_count
+
+            # RTT-based filtering: find measurement with minimum RTT
+            sorted_by_rtt = sorted(recent, key=lambda x: x[1])  # Sort by RTT
+            best_measurement = sorted_by_rtt[0]
+            best_clock_delta = best_measurement[0]
+            best_rtt = best_measurement[1]
+
+            # Calculate filtered mean from lowest-RTT measurements
+            filter_count = min(self.filtered_measurements_count, len(sorted_by_rtt))
+            filtered_measurements = sorted_by_rtt[:filter_count]
+            filtered_mean_clock_delta = sum(m[0] for m in filtered_measurements) / len(filtered_measurements)
 
             neighbour.sync_stats = SyncStats(
                 sync_count=sync_count,
@@ -397,50 +517,19 @@ class TimeDeltaService:
                 min_rtt=min_rtt,
                 max_rtt=max_rtt,
                 mean_rtt=mean_rtt,
+                best_clock_delta=best_clock_delta,
+                best_rtt=best_rtt,
+                filtered_mean_clock_delta=filtered_mean_clock_delta,
+                recent_measurements=recent,
             )
 
             self.logger.debug(
                 f"Neighbour {source} sync_stats: "
                 f"count={sync_count}  "
                 f"delta=[min:{min_clock_delta:+.6f}, avg:{mean_clock_delta:+.6f}, max:{max_clock_delta:+.6f}]  "
-                f"rtt=[min:{min_rtt:.6f}, avg:{mean_rtt:.6f}, max:{max_rtt:.6f}]"
+                f"rtt=[min:{min_rtt:.6f}, avg:{mean_rtt:.6f}, max:{max_rtt:.6f}]  "
+                f"filtered=[best:{best_clock_delta:+.6f}@{best_rtt:.6f}s, mean:{filtered_mean_clock_delta:+.6f}]"
             )
-
-    @staticmethod
-    def calculate_time_delta(
-        local_send_ts: float,
-        remote_receive_ts: float,
-        remote_send_ts: float,
-        local_receive_ts: float,
-        request_id: str = "",
-        remote_source: str = "",
-    ) -> TimeDeltaResult:
-        """
-        Calculate clock offset and round-trip time using the four timestamps
-        (similar to NTP symmetric algorithm).
-
-        Clock delta (θ) ≈ ((T2 - T1) + (T3 - T4)) / 2
-        RTT (δ)          = (T4 - T1) - (T3 - T2)
-
-        Where:
-            T1 = local_send_ts      (local time when request was sent)
-            T2 = remote_receive_ts  (remote time when request was received)
-            T3 = remote_send_ts     (remote time when response was sent)
-            T4 = local_receive_ts   (local time when response was received)
-        """
-        rtt = (local_receive_ts - local_send_ts) - (remote_send_ts - remote_receive_ts)
-        clock_delta = ((remote_receive_ts - local_send_ts) + (remote_send_ts - local_receive_ts)) / 2.0
-
-        return TimeDeltaResult(
-            request_id=request_id,
-            remote_source=remote_source,
-            clock_delta=clock_delta,
-            rtt=rtt,
-            local_send_ts=local_send_ts,
-            remote_receive_ts=remote_receive_ts,
-            remote_send_ts=remote_send_ts,
-            local_receive_ts=local_receive_ts,
-        )
 
     def get_time_deltas(self) -> list[TimeDeltaResult]:
         """Return a copy of the collected time delta results."""
@@ -464,10 +553,24 @@ class TimeDeltaService:
 
 if __name__ == "__main__":
     logging.getLogger("pika").setLevel(logging.WARNING)
+    logging.getLogger("pyp8s").setLevel(logging.WARNING)
     logging.getLogger("ExchangeThread").setLevel(logging.WARNING)
 
     log_level: str = config("LOG_LEVEL", default="INFO", cast=str)  # type: ignore[assignment]
-    logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO))
+    logging.root.handlers = []
+    
+    handlers = [logging.StreamHandler()]
+    logfile = config("LOGFILE", default="", cast=str)
+    if logfile:
+        handlers.append(logging.FileHandler(logfile))
+    
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper(), logging.INFO),
+        # level=logging.DEBUG,
+        format="%(asctime)s level=%(levelname)s t=%(threadName)s func=%(name)s.%(funcName)s %(message)s",
+        handlers=handlers
+    )
+    
 
     tdsvc = TimeDeltaService()
 

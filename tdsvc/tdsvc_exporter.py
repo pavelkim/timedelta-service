@@ -95,8 +95,12 @@ class TimeDeltaExporter(threading.Thread):
         for neighbour_data in packet.neighbours:
             neighbour = Neighbour.from_dict(neighbour_data)
     
-            MetricsHandler.set("tdsvc_delta", neighbour.sync_stats.last_clock_delta, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
+            # Use filtered (best) clock delta for metrics - more accurate than raw mean
+            MetricsHandler.set("tdsvc_delta_filtered", neighbour.sync_stats.filtered_mean_clock_delta, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
+            MetricsHandler.set("tdsvc_delta_best", neighbour.sync_stats.best_clock_delta, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
+            MetricsHandler.set("tdsvc_delta_raw", neighbour.sync_stats.last_clock_delta, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
             MetricsHandler.set("tdsvc_rtt", neighbour.sync_stats.last_rtt, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
+            MetricsHandler.set("tdsvc_rtt_best", neighbour.sync_stats.best_rtt, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
             MetricsHandler.set("tdsvc_syncs", neighbour.sync_stats.sync_count, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
             MetricsHandler.set("tdsvc_neighbour", neighbour.up, source=source)
 
@@ -133,10 +137,11 @@ class TimeDeltaExporter(threading.Thread):
                 f"    {'Neighbour':<20s}  "
                 f"{'Dead':>4s}  "
                 f"{'Syncs':>5s}  "
-                f"{'Clock Δ (last)':>16s}  "
-                f"{'Clock Δ (mean)':>16s}  "
+                f"{'Δ (best)':>14s}  "
+                f"{'Δ (filt)':>14s}  "
+                f"{'Δ (raw)':>14s}  "
                 f"{'RTT (last)':>12s}  "
-                f"{'RTT (mean)':>12s}"
+                f"{'RTT (best)':>12s}"
             )
             output.append(header + "\n")
             output.append(f"    {'─' * (len(header) - 4)}\n")
@@ -150,18 +155,20 @@ class TimeDeltaExporter(threading.Thread):
                         f"    {n_source:<20s}  "
                         f"{dead_str:>4s}  "
                         f"{s.sync_count:>5d}  "
-                        f"{s.last_clock_delta:>+16.6f}  "
-                        f"{s.mean_clock_delta:>+16.6f}  "
+                        f"{s.best_clock_delta:>+14.6f}  "
+                        f"{s.filtered_mean_clock_delta:>+14.6f}  "
+                        f"{s.last_clock_delta:>+14.6f}  "
                         f"{s.last_rtt:>12.6f}  "
-                        f"{s.mean_rtt:>12.6f}"
+                        f"{s.best_rtt:>12.6f}"
                     )
                 else:
                     row = (
                         f"    {n_source:<20s}  "
                         f"{dead_str:>4s}  "
                         f"{'–':>5s}  "
-                        f"{'–':>16s}  "
-                        f"{'–':>16s}  "
+                        f"{'–':>14s}  "
+                        f"{'–':>14s}  "
+                        f"{'–':>14s}  "
                         f"{'–':>12s}  "
                         f"{'–':>12s}"
                     )

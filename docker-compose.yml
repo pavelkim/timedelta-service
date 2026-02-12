@@ -1,0 +1,64 @@
+---
+services:
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    hostname: tdsvc-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  tdsvc-node-1:
+    build:
+      context: .
+      target: tdsvc
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./docker/tdsvc-node-1/.env:/app/.env
+      - ./docker/tdsvc-node-1/log:/app/log
+
+  tdsvc-node-2:
+    build:
+      context: .
+      target: tdsvc
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./docker/tdsvc-node-2/.env:/app/.env
+      - ./docker/tdsvc-node-2/log:/app/log
+
+  tdsvc-node-3:
+    build:
+      context: .
+      target: tdsvc
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./docker/tdsvc-node-3/.env:/app/.env
+      - ./docker/tdsvc-node-3/log:/app/log
+
+  tdsvc-exporter:
+    build:
+      context: .
+      target: tdsvc-exporter
+    ports:
+      - "18220:18220"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./docker/tdsvc-exporter/.env:/app/.env
+      - ./docker/tdsvc-exporter/log:/app/log
+...
