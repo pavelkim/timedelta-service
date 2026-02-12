@@ -295,9 +295,6 @@ class TimeDeltaService:
         self.publisher = None
         self.publisher_queue = queue.Queue()
 
-        self.keepalive_thread = None
-        self.keepalive_interval = config("KEEPALIVE_INTERVAL", default=5, cast=int)
-
         self.time_query_thread = None
         self.time_query_interval = config("TIME_QUERY_INTERVAL", default=2, cast=int)
         
@@ -309,6 +306,7 @@ class TimeDeltaService:
 
         self.pending_requests: dict[str, float] = {}
         self.pending_requests_lock = threading.Lock()
+        self.pending_requests_max_age = config("PENDING_REQUESTS_MAX_AGE", default=10, cast=int)
 
         self.time_deltas: list[TimeDeltaResult] = []
         self.time_deltas_lock = threading.Lock()
@@ -348,7 +346,6 @@ class TimeDeltaService:
             "publish_queue": self.publisher_queue,
         }
         self.setup_publisher()
-        # self.setup_keepalive_thread()
         self.setup_neighbor_discovery_thread()
         self.setup_time_query_thread()
         
@@ -364,11 +361,6 @@ class TimeDeltaService:
         self.time_query_thread = threading.Thread(target=self.time_query_loop, daemon=True)
         self.time_query_thread.start()
 
-    def setup_keepalive_thread(self):
-        self.logger.info(f"Setting up the keepalive thread")
-        self.keepalive_thread = threading.Thread(target=self.keepalive_loop, daemon=True)
-        self.keepalive_thread.start()
-    
     def setup_publisher(self):
         self.logger.info(f"Setting up the publisher")
 
@@ -526,10 +518,22 @@ class TimeDeltaService:
         self.logger.info(f"Starting time query loop (interval={self.time_query_interval}s)")
         while True:
             try:
+                self.cleanup_pending_requests()
                 self.send_what_time_is_it()
             except Exception as e:
                 self.logger.exception(f"Error in time query loop {e.__class__.__name__}: {e}")
             time.sleep(self.time_query_interval)
+
+    def cleanup_pending_requests(self):
+        """Remove pending requests older than the configured max age to prevent unbounded growth."""
+        max_age = self.pending_requests_max_age
+        now = time.time()
+        with self.pending_requests_lock:
+            stale = [rid for rid, ts in self.pending_requests.items() if (now - ts) > max_age]
+            for rid in stale:
+                del self.pending_requests[rid]
+            if stale:
+                self.logger.debug(f"Cleaned up {len(stale)} stale pending requests")
 
     def send_what_time_is_it(self):
         """Broadcast a 'what_time_is_it' packet and remember when it was sent."""
@@ -558,7 +562,7 @@ class TimeDeltaService:
             request_timestamp=packet.timestamp,
             received_at=received_at,
         )
-        self.logger.debug(f"my_time RESPONSE id={response.id} to request {packet.id}")
+        self.logger.debug(f"my_time RESPONSE to {packet.source} id={packet.id} resp={response.id}")
         self.publish_packet(response)
 
     def handle_my_time(self, packet: MyTimePacket):
@@ -572,13 +576,16 @@ class TimeDeltaService:
         self.logger.debug("Acquiring pending_requests_lock")
         with self.pending_requests_lock:
             lock_wait_duration = time.time() - lock_wait_start
-            local_send_ts = self.pending_requests.pop(packet.request_id, None)
+            local_send_ts = self.pending_requests.get(packet.request_id)
 
         if lock_wait_duration > 0.001:
             self.logger.warning(f"pending_requests_lock acquisition took {lock_wait_duration:.6f}s")
         else:
             self.logger.debug(f"pending_requests_lock acquisition took {lock_wait_duration:.6f}s")
         self.logger.debug("Releasing pending_requests_lock")
+
+        self.logger.debug(f"my_time from {packet.source} id={packet.id} "
+                          f"(their time={packet.time}, request_id={packet.request_id} ({'known' if local_send_ts else 'unknown'}))")
 
         if local_send_ts is None:
             self.logger.debug(f"my_time UNKNOWN for unknown/expired request_id={packet.request_id} from {packet.source}")
@@ -692,16 +699,6 @@ class TimeDeltaService:
         """Return a copy of the collected time delta results."""
         with self.time_deltas_lock:
             return list(self.time_deltas)
-
-
-    def keepalive_loop(self):
-        self.logger.info(f"Starting keepalive loop")
-        while True:
-            try:
-                self.publish_keepalive()
-            except Exception as e:
-                self.logger.exception(f"Error in keepalive loop {e.__class__.__name__}: {e}")
-            time.sleep(self.keepalive_interval)
 
     def publish_packet(self, packet: BasePacket):
         self.logger.debug(f"Publishing packet: {packet}")
