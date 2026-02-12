@@ -12,10 +12,12 @@
 
 import logging
 import os
+import signal
 import socket
+import threading
 import time
 
-import pyp8s
+from pyp8s import MetricsHandler
 from decouple import config
 from py_rmq_exchange import ExchangeThread
 
@@ -26,12 +28,19 @@ from tdsvc.packets import (
     SyncStats,
 )
 
+# Setup signal handlers for graceful shutdown
+def signal_handler(signum, frame):
+    print("\nReceived shutdown signal, stopping exporter...")
+    exporter.stop()
 
-class TimeDeltaExporter:
+
+class TimeDeltaExporter(threading.Thread):
     """Passively listens to neighbor_discovery messages and prints a stats overview."""
 
     def __init__(self):
+        super().__init__(daemon=True)
         self.logger = logging.getLogger(__name__)
+        self._stop_event = threading.Event()
 
         self.rmq_server_uri = config("RMQ_SERVER_URI", default="amqp://guest:guest@localhost:5672/")
         self.rmq_exchange = config("RMQ_EXCHANGE", default="tdsvc_exchange")
@@ -85,30 +94,38 @@ class TimeDeltaExporter:
 
         for neighbour_data in packet.neighbours:
             neighbour = Neighbour.from_dict(neighbour_data)
+    
+            MetricsHandler.set("tdsvc_delta", neighbour.sync_stats.last_clock_delta, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
+            MetricsHandler.set("tdsvc_rtt", neighbour.sync_stats.last_rtt, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
+            MetricsHandler.set("tdsvc_syncs", neighbour.sync_stats.sync_count, source=source, neighbour=neighbour.source, neighbour_up=neighbour.up)
+            MetricsHandler.set("tdsvc_neighbour", neighbour.up, source=source)
+
             if neighbour.source:
                 neighbours[neighbour.source] = neighbour
 
         self.hosts[source] = neighbours
         self.logger.debug(f"Updated host {source}: {len(neighbours)} neighbours")
 
-    def display_stats(self):
-        """Print a formatted table of all known hosts and their neighbours' sync stats."""
+    def render_stats(self):
+        """Render a formatted table of all known hosts and their neighbours' sync stats."""
         if not self.hosts:
-            print("\n[ No hosts discovered yet ]\n")
-            return
+            return "\n[ No hosts discovered yet ]\n"
 
+        # Build complete output
+        output = []
+        
         # Clear screen
-        print("\033[2J\033[H", end="")
+        output.append("\033[2J\033[H")
 
         now = time.time()
         ts = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
-        print(f"=== TimeDelta Exporter  |  {ts} ===\n")
+        output.append(f"=== TimeDelta Exporter  |  {ts} ===\n\n")
 
         for host, neighbours in sorted(self.hosts.items()):
-            print(f"  Host: {host}")
+            output.append(f"  Host: {host}\n")
 
             if not neighbours:
-                print(f"    (no neighbours)\n")
+                output.append(f"    (no neighbours)\n\n")
                 continue
 
             # Table header
@@ -121,8 +138,8 @@ class TimeDeltaExporter:
                 f"{'RTT (last)':>12s}  "
                 f"{'RTT (mean)':>12s}"
             )
-            print(header)
-            print(f"    {'─' * (len(header) - 4)}")
+            output.append(header + "\n")
+            output.append(f"    {'─' * (len(header) - 4)}\n")
 
             for n_source, neighbour in sorted(neighbours.items()):
                 s = neighbour.sync_stats
@@ -148,21 +165,28 @@ class TimeDeltaExporter:
                         f"{'–':>12s}  "
                         f"{'–':>12s}"
                     )
-                print(row)
+                output.append(row + "\n")
 
-            print()
+            output.append("\n")
 
-        print(f"  ({len(self.hosts)} host(s) reporting)\n")
+        output.append(f"  ({len(self.hosts)} host(s) reporting)\n")
+        
+        # Print all at once
+        return "".join(output)
+
+    def stop(self):
+        """Signal the thread to stop."""
+        self.logger.info("Stopping exporter...")
+        self._stop_event.set()
+        if hasattr(self, 'consumer'):
+            self.consumer.stop()
 
     def run(self):
         """Main loop: periodically display the stats table."""
         self.logger.info(f"Exporter running (display every {self.display_interval}s)")
-        try:
-            while True:
-                self.display_stats()
-                time.sleep(self.display_interval)
-        except KeyboardInterrupt:
-            print("\nExporter shutting down.")
+        while not self._stop_event.is_set():
+            self.logger.debug("Existing")
+            self._stop_event.wait(self.display_interval)
 
 
 if __name__ == "__main__":
@@ -171,6 +195,27 @@ if __name__ == "__main__":
 
     log_level: str = config("LOG_LEVEL", default="INFO", cast=str)  # type: ignore[assignment]
     logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO))
+    
+    METRICS_PORT = config("METRICS_PORT", default=18211, cast=int)
+    METRICS_HOST = config("METRICS_HOST", default="0.0.0.0", cast=str)
 
     exporter = TimeDeltaExporter()
-    exporter.run()
+        
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start metrics server and set callback
+    MetricsHandler.set_page("/tdsvc_exporter", callback=exporter.render_stats)
+    MetricsHandler.serve(listen_address=METRICS_HOST, listen_port=METRICS_PORT)
+    
+    # Start exporter thread
+    exporter.start()
+    
+    # Wait for thread to finish
+    try:
+        exporter.join()
+    except KeyboardInterrupt:
+        exporter.stop()
+        exporter.join()
+    
+    logging.warning("Exporter shut down.")

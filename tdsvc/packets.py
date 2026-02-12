@@ -74,6 +74,11 @@ class Neighbour:
     dead: bool = False
     sync_stats: SyncStats = field(default_factory=SyncStats)
 
+    @property
+    def up(self) -> int:
+        """Integer representation of the 'dead' status (1 for True, 0 for False)."""
+        return int(not self.dead)
+
     def to_dict(self) -> dict:
         d = asdict(self)
         return d
