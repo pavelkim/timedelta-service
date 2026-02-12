@@ -75,7 +75,7 @@ jobs:
           registry_address: "ghcr.io"
           registry_username: "${{ github.actor }}"
           registry_token: "${{ secrets.GITHUB_TOKEN }}"
-          name: "${{ github.repository }}"
+          name: "${{ github.repository }}/${{ env.APP_NAME }}"
           planned_version: "${{ env.PLANNED_VERSION }}"
 
 
