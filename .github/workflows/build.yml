@@ -68,15 +68,28 @@ jobs:
           fetch-depth: 0
 
 
-      - name: Build Docker image
-        id: build_docker_image
-        uses: reinvented-stuff/build-docker-image-action@2.0.0
+      - name: Build Docker image for service
+        id: build_docker_image_service
+        uses: reinvented-stuff/build-docker-image-action@2.7.0
         with:
           registry_address: "ghcr.io"
           registry_username: "${{ github.actor }}"
           registry_token: "${{ secrets.GITHUB_TOKEN }}"
-          name: "${{ github.repository }}/${{ env.APP_NAME }}"
+          name: "${{ github.repository }}/tdsvc"
           planned_version: "${{ env.PLANNED_VERSION }}"
+          target: "tdsvc"
+
+
+      - name: Build Docker image for exporter
+        id: build_docker_image_exporter
+        uses: reinvented-stuff/build-docker-image-action@2.7.0
+        with:
+          registry_address: "ghcr.io"
+          registry_username: "${{ github.actor }}"
+          registry_token: "${{ secrets.GITHUB_TOKEN }}"
+          name: "${{ github.repository }}/tdsvc-exporter"
+          planned_version: "${{ env.PLANNED_VERSION }}"
+          target: "tdsvc-exporter"
 
 
       - name: Send out notification about docker image build
@@ -85,7 +98,8 @@ jobs:
           message: |
             Docker image: <b>${{ env.APP_NAME }}</b> v${{ env.PLANNED_VERSION }} (${{ env.BRANCH_NAME }})
 
-            <code>${{ steps.build_docker_image.outputs.image_full_name }}</code>
+            <code>${{ steps.build_docker_image_service.outputs.image_full_name }}</code>
+            <code>${{ steps.build_docker_image_exporter.outputs.image_full_name }}</code>
           recipient: "${{ secrets.NOTIFICATIONS_DEFAULT_RECIPIENT }}"
           rest_gateway_url: "${{ secrets.REST_GATEWAY_API_URL }}"
           rest_gateway_token: "${{ secrets.REST_GATEWAY_TOKEN }}"
