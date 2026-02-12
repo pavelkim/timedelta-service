@@ -74,6 +74,7 @@ class BasePacket:
             "keepalive": KeepalivePacket,
             "what_time_is_it": WhatTimeIsItPacket,
             "my_time": MyTimePacket,
+            "neighbor_discovery": NeighborDiscoveryPacket,
         }
 
         packet_cls = packet_type_map.get(packet_type, BasePacket)
@@ -84,6 +85,26 @@ class BasePacket:
 class KeepalivePacket(BasePacket):
     """Keepalive packet with a timestamp for clock comparison."""
     type: str = "keepalive"
+    timestamp: float = field(default_factory=time.time)
+    time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()))
+    version: str = config("APP_VERSION", default="0.0.0", cast=str)  # type: ignore[assignment]
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(
+            type=data.get("type", "keepalive"),
+            source=data.get("source", cls.get_source_name()),
+            host_id=data.get("host_id", cls.get_source_name()),
+            id=data.get("id", str(uuid.uuid4())),
+            timestamp=data.get("timestamp", time.time()),
+            time=data.get("time", time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())),
+            version=data.get("version", config("APP_VERSION", default="0.0.0", cast=str)),
+        )
+
+@dataclass
+class NeighborDiscoveryPacket(BasePacket):
+    """Neighbor discovery packet."""
+    type: str = "neighbor_discovery"
     timestamp: float = field(default_factory=time.time)
     time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()))
     version: str = config("APP_VERSION", default="0.0.0", cast=str)  # type: ignore[assignment]
@@ -201,6 +222,12 @@ class TimeDeltaService:
 
         self.time_query_thread = None
         self.time_query_interval = config("TIME_QUERY_INTERVAL", default=2, cast=int)
+        
+        self.neighbor_discovery_thread = None
+        self.neighbor_discovery_interval = config("NEIGHBOR_DISCOVERY_INTERVAL", default=5, cast=int)
+        self.neighbor_age_timeout = config("NEIGHBOR_AGE_TIMEOUT", default=10, cast=int)
+        self.neighbours = {}
+        self.neighbours_lock = threading.Lock()
 
         self.pending_requests: dict[str, float] = {}
         self.pending_requests_lock = threading.Lock()
@@ -221,12 +248,13 @@ class TimeDeltaService:
                 "keepalive",
                 "what_time_is_it",
                 "my_time",
+                "neighbor_discovery",
                 "",
             ],
             "on_message_callback": self.consumer_callback,
-            "queue_name": self.consumer_queue_name,
+            # "queue_name": self.consumer_queue_name,
             "auto_ack": False,
-            "exclusive": False,
+            "exclusive": True,
             "prefetch_count": config("RMQ_PREFETCH_COUNT", default=1, cast=int),
             "queue_declare_arguments": {
                 "x-dead-letter-exchange": self.rmq_dlx_exchange,
@@ -242,8 +270,15 @@ class TimeDeltaService:
             "publish_queue": self.publisher_queue,
         }
         self.setup_publisher()
-        self.setup_keepalive_thread()
+        # self.setup_keepalive_thread()
+        self.setup_neighbor_discovery_thread()
         self.setup_time_query_thread()
+        
+
+    def setup_neighbor_discovery_thread(self):
+        self.logger.info(f"Setting up the neighbor discovery thread")
+        self.neighbor_discovery_thread = threading.Thread(target=self.neighbor_discovery_loop, daemon=True)
+        self.neighbor_discovery_thread.start()
 
     def setup_time_query_thread(self):
         """Set up a background thread that periodically broadcasts 'what_time_is_it' packets."""
@@ -296,6 +331,10 @@ class TimeDeltaService:
                 self.logger.debug(f"Ignoring own packet {packet.type} id={packet.id} host_id={packet.host_id}")
                 result = True
 
+            elif isinstance(packet, NeighborDiscoveryPacket):
+                self.handle_neighbor_discovery(packet)
+                result = True
+
             elif isinstance(packet, WhatTimeIsItPacket):
                 self.handle_what_time_is_it(packet)
                 result = True
@@ -323,6 +362,54 @@ class TimeDeltaService:
             else:
                 channel.basic_nack(delivery_tag)
 
+    def neighbor_discovery_loop(self):
+        """Periodically broadcasts 'neighbor_discovery' packets to find other instances."""
+        self.logger.info(f"Starting neighbor discovery loop (interval={self.neighbor_discovery_interval}s)")
+        while True:
+            try:
+                self.publish_neighbor_discovery()
+
+                # Check neighbours' age and mark dead ones
+                with self.neighbours_lock:
+                    now = time.time()
+                    neighbour_timeout = self.neighbor_age_timeout
+                    for source, info in self.neighbours.items():
+                        age = now - info.get("age", 0)
+                        if age > neighbour_timeout:
+                            if not info.get("dead", False):
+                                self.logger.warning(f"Neighbour {source} is dead (age={age:.1f}s, timeout={neighbour_timeout}s)")
+                                info["dead"] = True
+                        else:
+                            if info.get("dead", False):
+                                self.logger.info(f"Neighbour {source} is alive again (age={age:.1f}s)")
+                                info["dead"] = False
+
+            except Exception as e:
+                self.logger.exception(f"Error in neighbor discovery loop {e.__class__.__name__}: {e}")
+            time.sleep(self.neighbor_discovery_interval)
+
+    def publish_neighbor_discovery(self):
+        """Broadcast a 'neighbor_discovery' packet and remember the sender as a neighbor."""
+        packet = NeighborDiscoveryPacket()
+        self.logger.debug(f"Broadcasting neighbor_discovery id={packet.id}")
+        self.publish_packet(packet)
+
+    def handle_neighbor_discovery(self, packet: NeighborDiscoveryPacket):
+        """Handle an incoming 'neighbor_discovery' packet by recording the sender as a neighbor."""
+        self.logger.debug(f"neighbor_discovery from {packet.source} id={packet.id} time={packet.time}")
+
+        with self.neighbours_lock:
+            if packet.source not in self.neighbours:
+                self.logger.info(f"Discovered new neighbor: {packet.source} (host_id={packet.host_id})")
+                self.neighbours[packet.source] = {}
+
+            self.neighbours[packet.source].update({
+                "age": time.time(),
+                "host_id": packet.host_id,
+                "time": packet.time,
+                "timestamp": packet.timestamp,
+                "version": packet.version,
+            })
 
     def time_query_loop(self):
         """Periodically broadcasts 'what_time_is_it' packets"""
@@ -367,6 +454,7 @@ class TimeDeltaService:
     def handle_my_time(self, packet: MyTimePacket):
         """
         Handle an incoming 'my_time' response: calculate clock delta and RTT.
+        Only processes responses from known neighbours.
         """
         local_receive_ts = time.time()
 
@@ -398,11 +486,58 @@ class TimeDeltaService:
         with self.time_deltas_lock:
             self.time_deltas.append(result)
 
+        # Update neighbour stats
+        self.update_neighbour_stats(packet.source, result)
+
         self.logger.info(
             f"TimeDelta {result.remote_source}: "
             f"clock_delta={result.clock_delta:+.6f}s  RTT={result.rtt:.6f}s  "
             f"(id={result.request_id})"
         )
+
+    def update_neighbour_stats(self, source: str, result: TimeDeltaResult):
+        """Update a neighbour's sync statistics with the latest time delta result."""
+        with self.neighbours_lock:
+            neighbour = self.neighbours.get(source)
+            if neighbour is None:
+                self.logger.debug(f"Can't update stats for unknown neighbour {source}")
+                return
+
+            stats = neighbour.setdefault("sync_stats", {})
+            sync_count = stats.get("sync_count", 0) + 1
+
+            prev_mean_delta = stats.get("mean_clock_delta", 0.0)
+            prev_mean_rtt = stats.get("mean_rtt", 0.0)
+
+            # Running min / max
+            min_clock_delta = min(stats.get("min_clock_delta", result.clock_delta), result.clock_delta)
+            max_clock_delta = max(stats.get("max_clock_delta", result.clock_delta), result.clock_delta)
+            min_rtt = min(stats.get("min_rtt", result.rtt), result.rtt)
+            max_rtt = max(stats.get("max_rtt", result.rtt), result.rtt)
+
+            # Cumulative moving average
+            mean_clock_delta = prev_mean_delta + (result.clock_delta - prev_mean_delta) / sync_count
+            mean_rtt = prev_mean_rtt + (result.rtt - prev_mean_rtt) / sync_count
+
+            stats.update({
+                "sync_count": sync_count,
+                "last_sync": time.time(),
+                "last_clock_delta": result.clock_delta,
+                "last_rtt": result.rtt,
+                "min_clock_delta": min_clock_delta,
+                "max_clock_delta": max_clock_delta,
+                "mean_clock_delta": mean_clock_delta,
+                "min_rtt": min_rtt,
+                "max_rtt": max_rtt,
+                "mean_rtt": mean_rtt,
+            })
+
+            self.logger.info(
+                f"Neighbour {source} sync_stats: "
+                f"count={sync_count}  "
+                f"delta=[min:{min_clock_delta:+.6f}, avg:{mean_clock_delta:+.6f}, max:{max_clock_delta:+.6f}]  "
+                f"rtt=[min:{min_rtt:.6f}, avg:{mean_rtt:.6f}, max:{max_rtt:.6f}]"
+            )
 
     @staticmethod
     def calculate_time_delta(
@@ -471,6 +606,9 @@ class TimeDeltaService:
 
 
 if __name__ == "__main__":
+    logging.getLogger("pika").setLevel(logging.WARNING)
+    logging.getLogger("ExchangeThread").setLevel(logging.WARNING)
+
     log_level: str = config("LOG_LEVEL", default="INFO", cast=str)  # type: ignore[assignment]
     logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO))
 
