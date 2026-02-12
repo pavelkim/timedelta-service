@@ -1,4 +1,8 @@
 #!/bin/sh
+#
+# Docker container entrypoint script
+#
+
 set -e
 
 if [ -f ".version" ]; then
@@ -15,4 +19,4 @@ echo " Host ID: ${HOST_ID:-$(hostname)}"
 echo " Log Level: ${LOG_LEVEL:-INFO}"
 echo " RMQ URI: ${RMQ_SERVER_URI:-not set}"
 
-exec python -m tdsvc.tdsvc
+python -m tdsvc.tdsvc

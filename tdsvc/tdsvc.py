@@ -86,6 +86,7 @@ class KeepalivePacket(BasePacket):
     type: str = "keepalive"
     timestamp: float = field(default_factory=time.time)
     time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()))
+    version: str = config("APP_VERSION", default="0.0.0", cast=str)  # type: ignore[assignment]
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -96,6 +97,7 @@ class KeepalivePacket(BasePacket):
             id=data.get("id", str(uuid.uuid4())),
             timestamp=data.get("timestamp", time.time()),
             time=data.get("time", time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())),
+            version=data.get("version", config("APP_VERSION", default="0.0.0", cast=str)),
         )
 
 
@@ -214,8 +216,13 @@ class TimeDeltaService:
         self.logger.info("Setting up consumer")
         self.datasource_consumer_params = {
             "exchange": self.rmq_exchange,
-            "exchange_type": "fanout",
-            # "routing_keys": [],
+            "exchange_type": "direct",
+            "routing_keys": [
+                "keepalive",
+                "what_time_is_it",
+                "my_time",
+                "",
+            ],
             "on_message_callback": self.consumer_callback,
             "queue_name": self.consumer_queue_name,
             "auto_ack": False,
@@ -231,7 +238,7 @@ class TimeDeltaService:
         self.logger.info("Setting up posts publisher")
         self.publisher_params = {
             "exchange": self.rmq_exchange,
-            "exchange_type": "fanout",
+            "exchange_type": "direct",
             "publish_queue": self.publisher_queue,
         }
         self.setup_publisher()
@@ -344,7 +351,7 @@ class TimeDeltaService:
         Records the local receive time and includes it in the response.
         """
         received_at = time.time()
-        self.logger.info(
+        self.logger.debug(
             f"what_time_is_it REQUEST from {packet.source} id={packet.id} "
             f"(their time={packet.time})"
         )
@@ -354,7 +361,7 @@ class TimeDeltaService:
             request_timestamp=packet.timestamp,
             received_at=received_at,
         )
-        self.logger.info(f"my_time RESPONSE id={response.id} to request {packet.id}")
+        self.logger.debug(f"my_time RESPONSE id={response.id} to request {packet.id}")
         self.publish_packet(response)
 
     def handle_my_time(self, packet: MyTimePacket):
@@ -376,7 +383,7 @@ class TimeDeltaService:
         self.logger.debug("Releasing pending_requests_lock")
 
         if local_send_ts is None:
-            self.logger.warning(f"my_time UNKNOWN for unknown/expired request_id={packet.request_id} from {packet.source}")
+            self.logger.debug(f"my_time UNKNOWN for unknown/expired request_id={packet.request_id} from {packet.source}")
             return None
 
         result = self.calculate_time_delta(
@@ -452,7 +459,7 @@ class TimeDeltaService:
         self.logger.debug(f"Publishing packet: {packet}")
         payload = {
             "body": packet.to_json(),
-            "routing_key": "",
+            "routing_key": packet.type,
         }
         self.publisher_queue.put(payload)
 
