@@ -1,0 +1,171 @@
+---
+# yamllint disable rule:line-length
+# yamllint disable rule:truthy
+# yamllint disable rule:brackets
+
+name: Release
+
+on:
+  push:
+    branches: [ '*' ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+
+  notify_started:
+    name: Send notification on start
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Send notification on start
+        uses: rest-gateway/notification-action@1.0.9
+        with:
+          message: |
+            <b>Workflow:</b> <code>${GITHUB_WORKFLOW}</code>
+            <b>Ref:</b> <code>${GITHUB_REF#refs/heads/}'</code>
+            <b>Repository:</b> ${GITHUB_REPOSITORY} (${GITHUB_REF#refs/heads/})
+            <b>URL:</b> <code>https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}</code>
+          recipient: "${{ secrets.NOTIFICATIONS_DEFAULT_RECIPIENT }}"
+          rest_gateway_url: "${{ secrets.REST_GATEWAY_API_URL }}"
+          rest_gateway_token: "${{ secrets.REST_GATEWAY_TOKEN }}"
+          rest_gateway_bot_name: "${{ secrets.REST_GATEWAY_BOT_NAME }}"
+
+  validate_new_version:
+    name: Validate new version
+    runs-on: ubuntu-latest
+    outputs:
+      planned_version: ${{ steps.validate_new_version.outputs.planned_version }}
+      version_file_exists: ${{ steps.validate_new_version.outputs.version_file_exists }}
+      tag_hash: ${{ steps.validate_new_version.outputs.tag_hash }}
+      can_create: ${{ steps.validate_new_version.outputs.can_create }}
+      tag_exists: ${{ steps.validate_new_version.outputs.tag_exists }}
+      branch_name: ${{ steps.validate_new_version.outputs.branch_name }}
+
+    steps:
+
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use latest released action
+        id: validate_new_version
+        uses: reinvented-stuff/validate-version-action@1.2.0
+        with:
+          version_filename: ".version"
+          github_token: "${{ secrets.GITHUB_TOKEN }}"
+          fail_on_error: true
+
+  release:
+    name: Build, Release
+    runs-on: ubuntu-latest
+
+    outputs:
+      job_status: ${{ job.status }}
+
+    needs:
+      - validate_new_version
+
+    if: >
+      github.event_name == 'push'
+
+    env:
+      PLANNED_VERSION: ${{ needs.validate_new_version.outputs.planned_version }}
+      APP_NAME: "tdsvc"
+
+    steps:
+
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: generate_changelog
+        uses: reinvented-stuff/changelog-render-action@master
+        with:
+          long_changelog_export_filename: ".long_changelog.md"
+          short_changelog_export_filename: ".short_changelog.md"
+          print_out_changelogs: true
+
+      - name: Create a new tag
+        id: create_new_tag
+        if: >
+          needs.validate_new_version.outputs.can_create == 'true' &&
+          needs.validate_new_version.outputs.branch_name == 'master' &&
+          github.event_name == 'push'
+        run: |
+          curl --request POST --url https://api.github.com/repos/${{ github.repository }}/git/tags \
+          -H 'authorization: Bearer ${{ secrets.GITHUB_TOKEN }}' \
+          -H 'content-type: application/json' \
+          --data '{"tag": "${{ env.PLANNED_VERSION }}",
+            "message": "Pipeline build tag",
+            "object": "${{ github.sha }}",
+            "type": "commit",
+            "tagger": {
+              "name": "Alice from Wonderland",
+              "email": "noreply@localhost.localdomain",
+              "date": "${{steps.timestamp.outputs.timestamp}}"
+            }'
+
+      - name: Create a Release
+        id: create_release
+        if: >
+          needs.validate_new_version.outputs.can_create == 'true' &&
+          needs.validate_new_version.outputs.branch_name == 'master' &&
+          github.event_name == 'push'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.PLANNED_VERSION }}
+          release_name: ${{ env.PLANNED_RELEASE_NAME }}
+          body_path: ${{ steps.generate_changelog.outputs.release_changelog_filename }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Assets
+        id: upload_release_assets
+        shell: bash
+        run: >-
+          curl
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}"
+          -H "Content-Type: application/octet-stream"
+          --data-binary "@${{ steps.prepare_archive.outputs.archive_filename }}"
+          "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_release.outputs.id }}/assets?name=${{ steps.prepare_archive.outputs.archive_filename }}&label=${{ steps.prepare_archive.outputs.archive_filename }}"
+
+      - name: Notify about release
+        uses: rest-gateway/notification-action@1.0.9
+        if: always()
+        with:
+          message: |-
+            <b>Release ${{ env.APP_NAME }} ${{ env.PLANNED_RELEASE_NAME }}:</b>
+
+            <b>Outcome:</b> 
+            prepare_archive: ${{ steps.prepare_archive.outcome }}
+            install_gcloud: ${{ steps.install_gcloud.outcome }}
+            setup_gcp_authentication: ${{ steps.setup_gcp_authentication.outcome }}
+            obtain_gcp_token: ${{ steps.obtain_gcp_token.outcome }}
+            upload_to_google_bucket: ${{ steps.upload_to_google_bucket.outcome }}
+            list_artifacts: ${{ steps.list_artifacts.outcome }}
+            generate_changelog: ${{ steps.generate_changelog.outcome }}
+            create_new_tag: ${{ steps.create_new_tag.outcome }}
+            create_release: ${{ steps.create_release.outcome }}
+            upload_release_assets: ${{ steps.upload_release_assets.outcome }}
+
+            <b>Run:</b> <code>https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}</code>
+            <b>Artifact:</b> https://storage.googleapis.com/${{ secrets.GCP_BUCKET_NAME }}/${{ steps.prepare_archive.outputs.archive_filename }}
+            <b>Artifact repo:</b> https://storage.googleapis.com/${{ secrets.GCP_BUCKET_NAME }}/
+
+            <b>Release:</b>
+            <code>https://github.com/${{ github.repository }}/releases/tag/${{ env.PLANNED_VERSION }}</code>
+
+          recipient: "${{ secrets.NOTIFICATIONS_DEFAULT_RECIPIENT }}"
+          rest_gateway_url: "${{ secrets.REST_GATEWAY_API_URL }}"
+          rest_gateway_token: "${{ secrets.REST_GATEWAY_TOKEN }}"
+          rest_gateway_bot_name: "${{ secrets.REST_GATEWAY_BOT_NAME }}"
+
+
+...

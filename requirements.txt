@@ -1,0 +1,3 @@
+pyp8s
+vendor/py_rmq_exchange-3.0.0-py3-none-any.whl
+python-decouple==3.8
