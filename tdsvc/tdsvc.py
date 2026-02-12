@@ -25,6 +25,82 @@ from py_rmq_exchange import ExchangeThread
 
 HOST_ID: str = config("HOST_ID", default=socket.gethostname(), cast=str)  # type: ignore[assignment]
 
+
+@dataclass
+class SyncStats:
+    """Running statistics for time synchronisation with a neighbour."""
+    sync_count: int = 0
+    last_sync: float = 0.0
+    last_clock_delta: float = 0.0
+    last_rtt: float = 0.0
+    min_clock_delta: float = 0.0
+    max_clock_delta: float = 0.0
+    mean_clock_delta: float = 0.0
+    min_rtt: float = 0.0
+    max_rtt: float = 0.0
+    mean_rtt: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SyncStats":
+        return cls(
+            sync_count=data.get("sync_count", 0),
+            last_sync=data.get("last_sync", 0.0),
+            last_clock_delta=data.get("last_clock_delta", 0.0),
+            last_rtt=data.get("last_rtt", 0.0),
+            min_clock_delta=data.get("min_clock_delta", 0.0),
+            max_clock_delta=data.get("max_clock_delta", 0.0),
+            mean_clock_delta=data.get("mean_clock_delta", 0.0),
+            min_rtt=data.get("min_rtt", 0.0),
+            max_rtt=data.get("max_rtt", 0.0),
+            mean_rtt=data.get("mean_rtt", 0.0),
+        )
+
+
+@dataclass
+class Neighbour:
+    """
+    Represents a known neighbour (peer service instance).
+
+    :param host_id: str: Configured host identifier of the neighbour.
+    :param source: str: Source name of the neighbour.
+    :param version: str: Application version reported by the neighbour.
+    :param age: float: Timestamp of the last discovery message received.
+    :param time: str: Human-readable time from the last discovery message.
+    :param timestamp: float: Epoch timestamp from the last discovery message.
+    :param dead: bool: Whether the neighbour is considered unreachable.
+    :param sync_stats: SyncStats: Running time-sync statistics.
+    """
+    host_id: str = ""
+    source: str = ""
+    version: str = ""
+    age: float = field(default_factory=time.time)
+    time: str = ""
+    timestamp: float = 0.0
+    dead: bool = False
+    sync_stats: SyncStats = field(default_factory=SyncStats)
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Neighbour":
+        sync_stats_data = data.get("sync_stats")
+        return cls(
+            host_id=data.get("host_id", ""),
+            source=data.get("source", ""),
+            version=data.get("version", ""),
+            age=data.get("age", 0.0),
+            time=data.get("time", ""),
+            timestamp=data.get("timestamp", 0.0),
+            dead=data.get("dead", False),
+            sync_stats=SyncStats.from_dict(sync_stats_data) if isinstance(sync_stats_data, dict) else SyncStats(),
+        )
+
+
 @dataclass
 class BasePacket:
     """
@@ -103,22 +179,24 @@ class KeepalivePacket(BasePacket):
 
 @dataclass
 class NeighborDiscoveryPacket(BasePacket):
-    """Neighbor discovery packet."""
+    """Neighbor discovery packet carrying the sender's known neighbours."""
     type: str = "neighbor_discovery"
     timestamp: float = field(default_factory=time.time)
     time: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()))
     version: str = config("APP_VERSION", default="0.0.0", cast=str)  # type: ignore[assignment]
+    neighbours: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict):
         return cls(
-            type=data.get("type", "keepalive"),
+            type=data.get("type", "neighbor_discovery"),
             source=data.get("source", cls.get_source_name()),
             host_id=data.get("host_id", cls.get_source_name()),
             id=data.get("id", str(uuid.uuid4())),
             timestamp=data.get("timestamp", time.time()),
             time=data.get("time", time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())),
             version=data.get("version", config("APP_VERSION", default="0.0.0", cast=str)),
+            neighbours=data.get("neighbours", []),
         )
 
 
@@ -226,7 +304,7 @@ class TimeDeltaService:
         self.neighbor_discovery_thread = None
         self.neighbor_discovery_interval = config("NEIGHBOR_DISCOVERY_INTERVAL", default=5, cast=int)
         self.neighbor_age_timeout = config("NEIGHBOR_AGE_TIMEOUT", default=10, cast=int)
-        self.neighbours = {}
+        self.neighbours: dict[str, Neighbour] = {}
         self.neighbours_lock = threading.Lock()
 
         self.pending_requests: dict[str, float] = {}
@@ -373,43 +451,75 @@ class TimeDeltaService:
                 with self.neighbours_lock:
                     now = time.time()
                     neighbour_timeout = self.neighbor_age_timeout
-                    for source, info in self.neighbours.items():
-                        age = now - info.get("age", 0)
+                    for source, neighbour in self.neighbours.items():
+                        age = now - neighbour.age
                         if age > neighbour_timeout:
-                            if not info.get("dead", False):
+                            if not neighbour.dead:
                                 self.logger.warning(f"Neighbour {source} is dead (age={age:.1f}s, timeout={neighbour_timeout}s)")
-                                info["dead"] = True
+                                neighbour.dead = True
                         else:
-                            if info.get("dead", False):
+                            if neighbour.dead:
                                 self.logger.info(f"Neighbour {source} is alive again (age={age:.1f}s)")
-                                info["dead"] = False
+                                neighbour.dead = False
 
             except Exception as e:
                 self.logger.exception(f"Error in neighbor discovery loop {e.__class__.__name__}: {e}")
             time.sleep(self.neighbor_discovery_interval)
 
     def publish_neighbor_discovery(self):
-        """Broadcast a 'neighbor_discovery' packet and remember the sender as a neighbor."""
-        packet = NeighborDiscoveryPacket()
-        self.logger.debug(f"Broadcasting neighbor_discovery id={packet.id}")
+        """Broadcast a 'neighbor_discovery' packet including known neighbours."""
+        with self.neighbours_lock:
+            neighbours_data = [
+                neighbour.to_dict()
+                for neighbour in self.neighbours.values()
+            ]
+        packet = NeighborDiscoveryPacket(neighbours=neighbours_data)
+        self.logger.debug(f"Broadcasting neighbor_discovery id={packet.id} with {len(neighbours_data)} known neighbours")
         self.publish_packet(packet)
 
     def handle_neighbor_discovery(self, packet: NeighborDiscoveryPacket):
-        """Handle an incoming 'neighbor_discovery' packet by recording the sender as a neighbor."""
+        """Handle an incoming 'neighbor_discovery' packet by recording the sender as a neighbor
+        and merging its known-neighbours list into our own."""
+
         self.logger.debug(f"neighbor_discovery from {packet.source} id={packet.id} time={packet.time}")
 
         with self.neighbours_lock:
+            # Update or create the direct sender as a neighbour
             if packet.source not in self.neighbours:
-                self.logger.info(f"Discovered new neighbor: {packet.source} (host_id={packet.host_id})")
-                self.neighbours[packet.source] = {}
+                self.logger.info(f"Discovered new neighbor: {packet.source} (host_id={packet.host_id}, knows {len(packet.neighbours)} neighbours)")
+                self.neighbours[packet.source] = Neighbour()
 
-            self.neighbours[packet.source].update({
-                "age": time.time(),
-                "host_id": packet.host_id,
-                "time": packet.time,
-                "timestamp": packet.timestamp,
-                "version": packet.version,
-            })
+            sender = self.neighbours[packet.source]
+            sender.host_id = packet.host_id
+            sender.source = packet.source
+            sender.age = time.time()
+            sender.time = packet.time
+            sender.timestamp = packet.timestamp
+            sender.version = packet.version
+            sender.dead = False
+
+            # Merge neighbours reported by the sender
+            for remote_neighbour_data in packet.neighbours:
+                remote_neighbour = Neighbour.from_dict(remote_neighbour_data)
+                remote_source = remote_neighbour.source
+
+                # Skip ourselves and empty sources
+                if not remote_source or remote_source == HOST_ID:
+                    continue
+
+                if remote_source not in self.neighbours:
+                    self.logger.info(
+                        f"Discovered indirect neighbor: {remote_source} "
+                        f"(host_id={remote_neighbour.host_id}, via {packet.source})"
+                    )
+                    self.neighbours[remote_source] = Neighbour(
+                        host_id=remote_neighbour.host_id,
+                        source=remote_source,
+                        version=remote_neighbour.version,
+                        age=remote_neighbour.age,
+                        time=remote_neighbour.time,
+                        timestamp=remote_neighbour.timestamp,
+                    )
 
     def time_query_loop(self):
         """Periodically broadcasts 'what_time_is_it' packets"""
@@ -503,36 +613,39 @@ class TimeDeltaService:
                 self.logger.debug(f"Can't update stats for unknown neighbour {source}")
                 return
 
-            stats = neighbour.setdefault("sync_stats", {})
-            sync_count = stats.get("sync_count", 0) + 1
+            stats = neighbour.sync_stats
+            sync_count = stats.sync_count + 1
 
-            prev_mean_delta = stats.get("mean_clock_delta", 0.0)
-            prev_mean_rtt = stats.get("mean_rtt", 0.0)
-
-            # Running min / max
-            min_clock_delta = min(stats.get("min_clock_delta", result.clock_delta), result.clock_delta)
-            max_clock_delta = max(stats.get("max_clock_delta", result.clock_delta), result.clock_delta)
-            min_rtt = min(stats.get("min_rtt", result.rtt), result.rtt)
-            max_rtt = max(stats.get("max_rtt", result.rtt), result.rtt)
+            # Running min / max (first sample initialises both)
+            if stats.sync_count == 0:
+                min_clock_delta = result.clock_delta
+                max_clock_delta = result.clock_delta
+                min_rtt = result.rtt
+                max_rtt = result.rtt
+            else:
+                min_clock_delta = min(stats.min_clock_delta, result.clock_delta)
+                max_clock_delta = max(stats.max_clock_delta, result.clock_delta)
+                min_rtt = min(stats.min_rtt, result.rtt)
+                max_rtt = max(stats.max_rtt, result.rtt)
 
             # Cumulative moving average
-            mean_clock_delta = prev_mean_delta + (result.clock_delta - prev_mean_delta) / sync_count
-            mean_rtt = prev_mean_rtt + (result.rtt - prev_mean_rtt) / sync_count
+            mean_clock_delta = stats.mean_clock_delta + (result.clock_delta - stats.mean_clock_delta) / sync_count
+            mean_rtt = stats.mean_rtt + (result.rtt - stats.mean_rtt) / sync_count
 
-            stats.update({
-                "sync_count": sync_count,
-                "last_sync": time.time(),
-                "last_clock_delta": result.clock_delta,
-                "last_rtt": result.rtt,
-                "min_clock_delta": min_clock_delta,
-                "max_clock_delta": max_clock_delta,
-                "mean_clock_delta": mean_clock_delta,
-                "min_rtt": min_rtt,
-                "max_rtt": max_rtt,
-                "mean_rtt": mean_rtt,
-            })
+            neighbour.sync_stats = SyncStats(
+                sync_count=sync_count,
+                last_sync=time.time(),
+                last_clock_delta=result.clock_delta,
+                last_rtt=result.rtt,
+                min_clock_delta=min_clock_delta,
+                max_clock_delta=max_clock_delta,
+                mean_clock_delta=mean_clock_delta,
+                min_rtt=min_rtt,
+                max_rtt=max_rtt,
+                mean_rtt=mean_rtt,
+            )
 
-            self.logger.info(
+            self.logger.debug(
                 f"Neighbour {source} sync_stats: "
                 f"count={sync_count}  "
                 f"delta=[min:{min_clock_delta:+.6f}, avg:{mean_clock_delta:+.6f}, max:{max_clock_delta:+.6f}]  "

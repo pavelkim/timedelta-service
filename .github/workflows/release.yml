@@ -126,16 +126,6 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Upload Release Assets
-        id: upload_release_assets
-        shell: bash
-        run: >-
-          curl
-          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}"
-          -H "Content-Type: application/octet-stream"
-          --data-binary "@${{ steps.prepare_archive.outputs.archive_filename }}"
-          "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_release.outputs.id }}/assets?name=${{ steps.prepare_archive.outputs.archive_filename }}&label=${{ steps.prepare_archive.outputs.archive_filename }}"
-
       - name: Notify about release
         uses: rest-gateway/notification-action@1.0.9
         if: always()
@@ -153,7 +143,6 @@ jobs:
             generate_changelog: ${{ steps.generate_changelog.outcome }}
             create_new_tag: ${{ steps.create_new_tag.outcome }}
             create_release: ${{ steps.create_release.outcome }}
-            upload_release_assets: ${{ steps.upload_release_assets.outcome }}
 
             <b>Run:</b> <code>https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}</code>
             <b>Artifact:</b> https://storage.googleapis.com/${{ secrets.GCP_BUCKET_NAME }}/${{ steps.prepare_archive.outputs.archive_filename }}
